@@ -245,7 +245,7 @@ package/*.symbols.nupkg
 *.vbproj
 *.fsproj
 # Uncomment if you do not want to ignore the project files in your repo
-# !/*.csproj
+ !/*.csproj
 # !/*.vbproj
 # !/*.fsproj
  
