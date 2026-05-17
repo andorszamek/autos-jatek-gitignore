@@ -1,0 +1,11 @@
+[Unit]
+Description=Run AI Trading Bot daily after NYSE close
+Requires=trading-bot.service
+
+[Timer]
+# 17:00 ET = 22:00 UTC (winter) / 21:00 UTC (summer) — use UTC+1h buffer
+OnCalendar=*-*-* 22:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target

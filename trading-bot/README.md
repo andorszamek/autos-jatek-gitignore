@@ -101,6 +101,106 @@ sudo systemctl start trading-bot.timer
 
 ---
 
+## Raspberry Pi Setup (English)
+
+The Pi is a **run-only** node — it never trains the model.
+Training always happens on a Mac/desktop with the full ML stack.
+
+### Step-by-step
+
+**1. Clone the repo on the Pi**
+
+```bash
+git clone <repo-url> ~/trading-bot
+cd ~/trading-bot
+```
+
+**2. Create a virtual environment and install runtime dependencies only**
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install alpaca-py pandas pyarrow lightgbm python-dotenv pyyaml yfinance requests
+```
+
+> `lightgbm` is needed for inference (loading and running the model).
+> Heavy training dependencies (`scikit-learn`, `vectorbt`, etc.) are NOT needed on the Pi.
+
+**3. Copy `.env` and the trained model from your Mac**
+
+```bash
+# On your Mac:
+scp .env pi@<PI_IP>:~/trading-bot/.env
+scp models/latest.lgb pi@<PI_IP>:~/trading-bot/models/latest.lgb
+```
+
+**4. Set up systemd service and timer**
+
+```bash
+sudo cp systemd/trading-bot.service /etc/systemd/system/
+sudo cp systemd/trading-bot.timer   /etc/systemd/system/
+
+sudo systemctl daemon-reload
+sudo systemctl enable trading-bot.timer
+sudo systemctl start  trading-bot.timer
+```
+
+Verify the timer is active:
+
+```bash
+systemctl status trading-bot.timer
+systemctl list-timers trading-bot.timer
+```
+
+**5. Updating the model**
+
+Retrain on your Mac, then push the new model to the Pi:
+
+```bash
+# On your Mac (after running scripts/train.py):
+scp models/latest.lgb pi@<PI_IP>:~/trading-bot/models/latest.lgb
+```
+
+The next timer cycle will automatically use the new model.
+
+### Health check log location
+
+After each run, the Pi writes a health status file:
+
+```
+~/trading-bot/logs/health.json
+```
+
+Example contents:
+
+```json
+{
+  "last_run": "2024-01-15T22:00:01+00:00",
+  "last_success": "2024-01-15T22:00:01+00:00",
+  "last_error": null
+}
+```
+
+Tail the journal for live logs:
+
+```bash
+journalctl -u trading-bot.service -f
+```
+
+Or inspect structured JSON logs:
+
+```bash
+tail -f ~/trading-bot/logs/trading_$(date +%Y%m%d).log | python3 -m json.tool
+```
+
+### Note: Pi never runs training
+
+- **Never** run `scripts/train.py` on the Pi — it requires heavy dependencies not installed.
+- The Pi only runs `scripts/run_paper.py` via the systemd timer.
+- Always train on a machine with the full `requirements.txt` stack installed.
+
+---
+
 ## Élő kereskedés (NE csináld, amíg hónapokig nem paperezik)
 
 Élő kereskedés aktiválásához **mindkét** feltétel szükséges egyszerre:

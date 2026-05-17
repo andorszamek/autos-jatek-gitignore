@@ -26,6 +26,11 @@ def main() -> None:
         action="store_true",
         help="Disable cost modelling (sanity check only — not for real evaluation)",
     )
+    parser.add_argument(
+        "--refresh",
+        action="store_true",
+        help="Force re-download data (ignore parquet cache)",
+    )
     args = parser.parse_args()
 
     from src.config import load_config
@@ -44,7 +49,13 @@ def main() -> None:
     days = cfg["history_days"]
 
     print(f"Loading data for backtest: {symbols}, {days} days...")
-    df = load_history(symbols=symbols, timeframe=cfg["timeframe"], days=days, cfg=cfg)
+    df = load_history(
+        symbols=symbols,
+        timeframe=cfg["timeframe"],
+        days=days,
+        cfg=cfg,
+        force_refresh=args.refresh,
+    )
 
     print("Running backtest...")
     results = run_backtest(df, cfg)

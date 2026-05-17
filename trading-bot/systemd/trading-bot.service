@@ -1,0 +1,16 @@
+[Unit]
+Description=AI Trading Bot — paper trading cycle
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=pi
+WorkingDirectory=/home/pi/trading-bot
+ExecStart=/home/pi/trading-bot/.venv/bin/python scripts/run_paper.py
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
