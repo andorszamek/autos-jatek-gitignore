@@ -155,6 +155,7 @@ Windows/*.winmd
 # Tools & scripts
 tools/
 scripts/
+!trading-bot/scripts/
  
 # Application settings
 app.config

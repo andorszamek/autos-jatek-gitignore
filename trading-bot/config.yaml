@@ -1,0 +1,20 @@
+universe: ["SPY"]
+timeframe: "1Day"
+initial_capital: 1000
+history_days: 1500
+
+model:
+  type: "lightgbm"
+  target: "next_day_up"
+
+risk:
+  max_position_pct: 0.10
+  stop_loss_pct: 0.03
+  daily_max_loss_pct: 0.04
+  kill_switch_drawdown_pct: 0.20
+
+backtest:
+  commission: 0.0
+  slippage_pct: 0.0002
+  fx_cost_pct: 0.005
+  train_test_split: "walk_forward"
