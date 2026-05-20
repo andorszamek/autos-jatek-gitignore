@@ -22,6 +22,7 @@ def main() -> None:
     )
     parser.add_argument("--symbols", nargs="+", help="Override universe symbols")
     parser.add_argument("--days", type=int, help="Override history_days")
+    parser.add_argument("--refresh", action="store_true", help="Force re-download, ignore cache")
     args = parser.parse_args()
 
     from src.config import load_config
@@ -33,7 +34,13 @@ def main() -> None:
     print(f"Downloading {days} days of {cfg['timeframe']} data for: {symbols}")
 
     from src.data_loader import load_history
-    df = load_history(symbols=symbols, timeframe=cfg["timeframe"], days=days, cfg=cfg)
+    df = load_history(
+        symbols=symbols,
+        timeframe=cfg["timeframe"],
+        days=days,
+        cfg=cfg,
+        force_refresh=args.refresh,
+    )
     print(f"Done. {len(df)} rows loaded.")
 
 

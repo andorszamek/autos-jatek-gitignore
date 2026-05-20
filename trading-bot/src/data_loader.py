@@ -200,14 +200,22 @@ def load_history(
         cache_path = _data_path(sym, timeframe)
 
         if not force_refresh and cache_path.exists():
-            logger.info("[data_loader] Loading %s from cache: %s", sym, cache_path)
             try:
                 cached = pd.read_parquet(cache_path)
-                # Ensure timestamp is tz-aware
                 if "timestamp" in cached.columns:
                     cached["timestamp"] = pd.to_datetime(cached["timestamp"], utc=True)
-                frames.append(cached)
-                continue
+                # Only use cache if it covers the requested start date (30-day buffer)
+                if cached["timestamp"].min() <= start + timedelta(days=30):
+                    logger.info("[data_loader] Loading %s from cache (%d rows)", sym, len(cached))
+                    frames.append(cached)
+                    continue
+                else:
+                    logger.info(
+                        "[data_loader] Cache for %s only goes back %d days, need %d — re-fetching",
+                        sym,
+                        (cached["timestamp"].max() - cached["timestamp"].min()).days,
+                        days,
+                    )
             except Exception as exc:
                 logger.warning("[data_loader] Cache read failed for %s: %s — re-fetching", sym, exc)
 
