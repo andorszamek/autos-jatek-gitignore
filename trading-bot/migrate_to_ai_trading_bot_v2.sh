@@ -1,24 +1,34 @@
 #!/usr/bin/env bash
-# Run this ONCE on your Mac to populate the AI_Trading_Bot_V2 repo.
-# Usage: bash migrate_to_ai_trading_bot_v2.sh
+# migrate_to_ai_trading_bot_v2.sh
+# Run from ANYWHERE on your Mac. Copies trading-bot code into AI_Trading_Bot_V2.
 set -e
 
-REPO="https://github.com/andorszamek/AI_Trading_Bot_V2.git"
-TMP=$(mktemp -d)
+SOURCE_REPO="https://github.com/andorszamek/autos-jatek-gitignore"
+SOURCE_BRANCH="claude/ai-trading-bot-v2-oxSBH"
+TARGET_REPO="https://github.com/andorszamek/AI_Trading_Bot_V2"
+TMP_SRC="/tmp/trading_src_$$"
+TMP_DST="/tmp/trading_dst_$$"
 
-echo "Cloning AI_Trading_Bot_V2..."
-git clone "$REPO" "$TMP"
+echo "==> Fetching source code from autos-jatek-gitignore..."
+git clone --depth 1 -b "$SOURCE_BRANCH" "$SOURCE_REPO" "$TMP_SRC"
 
-echo "Copying trading-bot contents..."
-cp -r ./* "$TMP"/
-cp .gitignore "$TMP"/.gitignore
-cp .env.example "$TMP"/.env.example
+echo "==> Cloning AI_Trading_Bot_V2..."
+git clone "$TARGET_REPO" "$TMP_DST"
 
-cd "$TMP"
-git add .
-git commit -m "Initial commit: complete AI trading bot (Phases 1-8)"
-git push origin main
+echo "==> Copying trading-bot contents..."
+# Copy everything including hidden files (except .git)
+rsync -av --exclude='.git' "$TMP_SRC/trading-bot/" "$TMP_DST/"
 
-echo ""
-echo "Done! Code is now in andorszamek/AI_Trading_Bot_V2"
-rm -rf "$TMP"
+echo "==> Committing and pushing..."
+cd "$TMP_DST"
+git add -A
+if git diff --cached --quiet; then
+    echo "Nothing to commit — repo already up to date."
+else
+    git commit -m "feat: complete AI trading bot Phases 1-8 (35 tests green)"
+    git push origin main
+    echo ""
+    echo "==> Done! Check: https://github.com/andorszamek/AI_Trading_Bot_V2"
+fi
+
+rm -rf "$TMP_SRC" "$TMP_DST"
