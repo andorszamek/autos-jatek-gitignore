@@ -81,6 +81,7 @@ def _run_fold(
     test_df: pd.DataFrame,
     cfg: dict[str, Any],
     initial_cash: float,
+    pretrained_model=None,
 ) -> tuple[list[dict], pd.Series]:
     """Run one walk-forward fold. Returns (trades, equity_series)."""
     from src.features import build_features
@@ -91,27 +92,28 @@ def _run_fold(
     else:
         from src.model import train as model_train, predict_proba
 
-    # Build features for this fold
-    try:
-        X_train, y_train = build_features(train_df)
-    except Exception as exc:
-        logger.warning("[backtest] Fold train feature build failed: %s", exc)
-        # Return flat equity
-        dates = _extract_dates(test_df)
-        return [], pd.Series(initial_cash, index=dates)
+    if pretrained_model is not None:
+        model = pretrained_model
+    else:
+        # Build features and train fresh model for this fold
+        try:
+            X_train, y_train = build_features(train_df)
+        except Exception as exc:
+            logger.warning("[backtest] Fold train feature build failed: %s", exc)
+            dates = _extract_dates(test_df)
+            return [], pd.Series(initial_cash, index=dates)
 
-    if y_train is None or len(X_train) < 20:
-        logger.warning("[backtest] Fold: not enough training data (%d rows)", len(X_train))
-        dates = _extract_dates(test_df)
-        return [], pd.Series(initial_cash, index=dates)
+        if y_train is None or len(X_train) < 20:
+            logger.warning("[backtest] Fold: not enough training data (%d rows)", len(X_train))
+            dates = _extract_dates(test_df)
+            return [], pd.Series(initial_cash, index=dates)
 
-    # Train model
-    try:
-        model = model_train(X_train, y_train, cfg)
-    except Exception as exc:
-        logger.warning("[backtest] Fold model training failed: %s", exc)
-        dates = _extract_dates(test_df)
-        return [], pd.Series(initial_cash, index=dates)
+        try:
+            model = model_train(X_train, y_train, cfg)
+        except Exception as exc:
+            logger.warning("[backtest] Fold model training failed: %s", exc)
+            dates = _extract_dates(test_df)
+            return [], pd.Series(initial_cash, index=dates)
 
     # Extract cost parameters
     from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD
@@ -325,6 +327,18 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
         n_dev, n_oos, oos_fraction * 100,
     )
 
+    # Load pre-trained model if --use-saved (skips per-fold training)
+    pretrained = None
+    if cfg.get("_use_saved_model"):
+        model_type = cfg.get("_model_type", "lgbm")
+        model_path = str(_ROOT / "models" / ("latest.lstm" if model_type == "lstm" else "latest.lgb"))
+        if model_type == "lstm":
+            from src.model_lstm import load as _load_model
+        else:
+            from src.model import load as _load_model
+        pretrained = _load_model(model_path)
+        print(f"[backtest] Using pre-trained model: {model_path}")
+
     # ---- Walk-forward on development data ----
     fold_size = n_dev // n_folds
     min_train = max(60, int(fold_size * 0.6))
@@ -355,7 +369,7 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
             fold_idx, len(train_df), len(test_df),
         )
 
-        fold_trades, fold_equity = _run_fold(train_df, test_df, cfg, current_equity)
+        fold_trades, fold_equity = _run_fold(train_df, test_df, cfg, current_equity, pretrained_model=pretrained)
         all_trades.extend(fold_trades)
         equity_segments.append(fold_equity)
         if not fold_equity.empty:
@@ -372,7 +386,7 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
     print("\n[backtest] Running true OOS evaluation on held-out period...")
     oos_train_df = df[df["timestamp"].dt.normalize().isin(set(dev_dates))].copy()
     oos_test_df = df[df["timestamp"].dt.normalize().isin(set(oos_dates))].copy()
-    oos_trades, oos_equity_raw = _run_fold(oos_train_df, oos_test_df, cfg, initial_capital)
+    oos_trades, oos_equity_raw = _run_fold(oos_train_df, oos_test_df, cfg, initial_capital, pretrained_model=pretrained)
 
     oos_start = pd.Timestamp(oos_dates[0]) - pd.Timedelta(days=1)
     oos_equity = pd.concat([pd.Series({oos_start: initial_capital}), oos_equity_raw]).sort_index()

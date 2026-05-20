@@ -24,6 +24,8 @@ def main() -> None:
     )
     parser.add_argument("--model", choices=["lstm", "lgbm"], default="lstm",
                         help="Model architecture (default: lstm)")
+    parser.add_argument("--use-saved", action="store_true",
+                        help="Use pre-trained model from models/ (fast — no per-fold training)")
     parser.add_argument(
         "--no-costs",
         action="store_true",
@@ -40,6 +42,7 @@ def main() -> None:
     cfg = load_config()
 
     cfg["_model_type"] = args.model
+    cfg["_use_saved_model"] = args.use_saved
 
     if args.no_costs:
         print("WARNING: running WITHOUT costs — sanity comparison only.")
