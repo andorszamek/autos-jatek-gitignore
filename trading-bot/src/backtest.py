@@ -202,6 +202,13 @@ def _run_fold(
                 new_s  = momentum_score(features_by_sym.get(new_target))
                 if new_s > curr_s * 1.02:
                     committed_target = new_target
+
+            # Absolute momentum gate: if top asset 3M return is negative → cash
+            if committed_target and committed_target in features_by_sym:
+                X_top = features_by_sym[committed_target]
+                if "RET_60" in X_top.columns and float(X_top["RET_60"].iloc[-1]) <= 0.0:
+                    committed_target = None  # go to cash
+
             last_rotation_date = test_date
 
         target_sym = committed_target

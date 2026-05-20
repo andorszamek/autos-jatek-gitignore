@@ -361,6 +361,13 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     else:
         target_sym = currently_held  # Hold through the week, ML can still exit
 
+    # Absolute momentum gate: if top asset 3M return ≤ 0 → go to cash
+    if target_sym and target_sym in features_by_sym:
+        X_top = features_by_sym[target_sym]
+        if "RET_60" in X_top.columns and float(X_top["RET_60"].iloc[-1]) <= 0.0:
+            logger.info("[runner] Absolute momentum negative for %s — going to cash", target_sym)
+            target_sym = None
+
     logger.info("[runner] Rotation day=%s target=%s held=%s", is_rotation_day, target_sym, currently_held)
 
     # ── Rotation: sell any held position that is NOT the target ──────────
