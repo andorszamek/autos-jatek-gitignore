@@ -32,7 +32,12 @@ def _device():
     return torch.device("cpu")
 
 
-def _build_net(n_features: int, hidden: int = 128, n_layers: int = 2, dropout: float = 0.2):
+def _build_net(n_features: int, hidden: int = 32, n_layers: int = 1, dropout: float = 0.0):
+    """Small model by default (hidden=32, 1 layer) to reduce overfitting.
+
+    With ~1000 training sequences, 32 hidden units gives ~3K parameters
+    vs 128 hidden / 2 layers = ~213K (severe overfit risk).
+    """
     import torch.nn as nn
 
     class _Net(nn.Module):
@@ -44,17 +49,16 @@ def _build_net(n_features: int, hidden: int = 128, n_layers: int = 2, dropout: f
                 batch_first=True,
             )
             self.head = nn.Sequential(
-                nn.Linear(hidden, 64),
+                nn.Linear(hidden, hidden),
                 nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(64, 1),
+                nn.Dropout(0.5),          # aggressive dropout to fight overfit
+                nn.Linear(hidden, 1),
                 nn.Sigmoid(),
             )
 
         def forward(self, x):
-            # x: (batch, seq_len, features)
             _, (h, _) = self.lstm(x)
-            return self.head(h[-1]).squeeze(-1)  # last layer hidden state
+            return self.head(h[-1]).squeeze(-1)
 
     return _Net()
 
@@ -138,7 +142,9 @@ def train(X: pd.DataFrame, y: pd.Series, cfg: dict[str, Any] | None = None) -> L
     print(f"{'=' * 55}")
 
     net = _build_net(n_features).to(device)
-    optimizer = torch.optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-4)
+    n_params = sum(p.numel() for p in net.parameters())
+    print(f"  Model parameters: {n_params:,}")
+    optimizer = torch.optim.Adam(net.parameters(), lr=0.001, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="max", patience=5, factor=0.5, min_lr=1e-5
     )
