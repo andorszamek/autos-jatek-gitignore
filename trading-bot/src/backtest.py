@@ -202,18 +202,28 @@ def _run_fold(
             in_golden_cross = sma50_vs_sma200 > 0.0
             in_death_cross  = sma50_vs_sma200 < -0.005
 
+            stop_loss_pct = float(cfg.get("risk", {}).get("stop_loss_pct", 0.03))
             current_qty = positions.get(sym, {}).get("qty", 0)
             desired_side = None
             desired_qty = 0
 
-            # Exit: death cross OR ML bearish
-            if current_qty > 0 and (in_death_cross or proba < sell_threshold):
-                desired_side = "sell"
-                desired_qty = current_qty
-            # Entry: golden cross + ML not bearish
-            elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
-                desired_side = "buy"
-                desired_qty = max(1, floor(max_pos_pct * cash / current_price))
+            # Stop-loss (highest priority — matches live risk.py behaviour)
+            if current_qty > 0:
+                entry_price = positions[sym]["avg_price"]
+                if current_price < entry_price * (1 - stop_loss_pct):
+                    desired_side = "sell"
+                    desired_qty = current_qty
+
+            # Strategy signals (only if stop-loss didn't fire)
+            if desired_side is None:
+                # Exit: death cross OR ML bearish
+                if current_qty > 0 and (in_death_cross or proba < sell_threshold):
+                    desired_side = "sell"
+                    desired_qty = current_qty
+                # Entry: golden cross + ML not bearish
+                elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
+                    desired_side = "buy"
+                    desired_qty = max(1, floor(max_pos_pct * cash / current_price))
 
             if desired_side is None or desired_qty < 1:
                 continue
