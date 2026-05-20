@@ -18,8 +18,8 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BUY_THRESHOLD  = 0.52
-SELL_THRESHOLD = 0.48
+BUY_THRESHOLD  = 0.505
+SELL_THRESHOLD = 0.495
 
 
 def decide(
