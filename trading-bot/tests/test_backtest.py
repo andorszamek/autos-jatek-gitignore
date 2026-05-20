@@ -182,10 +182,10 @@ def test_cash_constraint():
     """
     from src.backtest import run_backtest
 
-    n = 200
+    n = 310
     prices = np.ones(n) * 100.0  # constant price
     # Add a slight uptrend at the end to trigger a buy signal
-    prices[100:] = 101.0
+    prices[155:] = 101.0
     dates = pd.date_range("2018-01-02", periods=n, freq="B", tz="UTC")
     df = pd.DataFrame({
         "timestamp": dates,
@@ -249,6 +249,6 @@ def test_equity_csv_written(tmp_path, monkeypatch):
     cfg = _base_cfg()
     results = bt_mod.run_backtest(df, cfg)
 
-    # Find written CSV
-    csv_files = list(tmp_path.rglob("equity.csv"))
-    assert len(csv_files) >= 1, "Expected at least one equity.csv written"
+    # Find written equity CSVs (oos_equity.csv and dev_equity.csv)
+    csv_files = list(tmp_path.rglob("*equity.csv"))
+    assert len(csv_files) >= 1, "Expected at least one *equity.csv written"

@@ -220,19 +220,30 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     }
 
     # ------------------------------------------------------------------
-    # 1. Load model (lazy import to avoid training deps on Pi)
+    # 1. Load model (prefer LSTM if available, fall back to LightGBM)
     # ------------------------------------------------------------------
-    model_path = _MODELS_DIR / "latest.lgb"
-    if not model_path.exists():
-        msg = f"Model not found at {model_path}. Run scripts/train.py first."
+    lstm_path = _MODELS_DIR / "latest.lstm"
+    lgbm_path = _MODELS_DIR / "latest.lgb"
+
+    if lstm_path.exists():
+        model_path = lstm_path
+        model_type = "lstm"
+    elif lgbm_path.exists():
+        model_path = lgbm_path
+        model_type = "lgbm"
+    else:
+        msg = f"No model found in {_MODELS_DIR}. Run scripts/train.py first."
         logger.error("[runner] %s", msg)
         summary["errors"].append(msg)
         return summary
 
     try:
-        from src.model import load as model_load
+        if model_type == "lstm":
+            from src.model_lstm import load as model_load
+        else:
+            from src.model import load as model_load
         model = model_load(str(model_path))
-        logger.info("[runner] Model loaded from %s", model_path)
+        logger.info("[runner] Model loaded from %s (type=%s)", model_path, model_type)
     except Exception as exc:
         msg = f"Failed to load model: {exc}"
         logger.error("[runner] %s", msg)
@@ -281,9 +292,9 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
             db_positions[sym] = bpos
 
     # ------------------------------------------------------------------
-    # 4. Get latest bars and build features
+    # 4. Get latest bars and build features (290-day lookback for LSTM)
     # ------------------------------------------------------------------
-    lookback = 30
+    lookback = 290
     try:
         from src.data_loader import get_latest_bars
         bars_df = get_latest_bars(symbols, lookback=lookback, cfg=cfg)
@@ -299,147 +310,204 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     # ------------------------------------------------------------------
     from src.risk import RiskManager
     risk_mgr = RiskManager(cfg, initial_equity=equity)
-
-    # Daily start equity: approximate as current equity (first cycle of the day)
     daily_start_equity = equity
 
     # ------------------------------------------------------------------
-    # 6. Per-symbol: features → signal → risk → order
+    # 6. Build features for all symbols → momentum rank → rotate
     # ------------------------------------------------------------------
-    from src.features import build_features, FEATURE_COLUMNS
-    from src.strategy import decide
+    from src.features import build_features
+    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank
+
+    features_by_sym: dict[str, object] = {}
+    price_by_sym: dict[str, float] = {}
 
     for sym in symbols:
         sym_bars = bars_df[bars_df["symbol"] == sym].copy()
         if sym_bars.empty:
             logger.warning("[runner] No bars for %s", sym)
             continue
-
-        # Build features (inference mode)
+        current_price = float(sym_bars["close"].iloc[-1])
+        price_by_sym[sym] = current_price
         try:
             X, _ = build_features(sym_bars)
         except Exception as exc:
             logger.warning("[runner] Feature build failed for %s: %s", sym, exc)
             continue
+        if not X.empty:
+            features_by_sym[sym] = X
 
-        if X.empty:
-            logger.warning("[runner] Empty features for %s", sym)
+    if not features_by_sym:
+        summary["errors"].append("No features built for any symbol")
+        return summary
+
+    # Dual-momentum: pick top-ranked asset
+    target_sym = momentum_rank(features_by_sym)
+    logger.info("[runner] Momentum target: %s", target_sym)
+
+    # ── Rotation: sell any held position that is NOT the target ──────────
+    for held_sym in list(db_positions.keys()):
+        if held_sym == target_sym:
             continue
-
-        # Current position
-        current_pos = db_positions.get(sym, {})
-        current_qty = current_pos.get("qty", 0)
-        avg_entry = current_pos.get("avg_price", 0.0)
-
-        # Current price (last close)
-        current_price = float(sym_bars["close"].iloc[-1])
-
-        # Check stop-loss first
-        if current_qty > 0 and avg_entry > 0:
-            if risk_mgr.check_stop_loss(sym, current_price, avg_entry):
-                logger.warning("[runner] Stop-loss triggered for %s — selling", sym)
-                try:
-                    order = broker.submit_order(sym, current_qty, "sell")
-                    pnl = (current_price - avg_entry) * current_qty
-                    _insert_trade(sym, "sell", current_qty, current_price, pnl=pnl)
-                    _upsert_position(sym, 0, 0.0)
-                    db_positions.pop(sym, None)
-                    summary["orders_submitted"] += 1
-                    summary["decisions"].append({
-                        "symbol": sym,
-                        "signal": "stop_loss",
-                        "risk_decision": "approved",
-                        "order_id": order.id,
-                    })
-                except Exception as exc:
-                    logger.error("[runner] Stop-loss order failed for %s: %s", sym, exc)
-                    summary["errors"].append(f"stop_loss order {sym}: {exc}")
-                continue
-
-        # Strategy signal
-        action, desired_qty = decide(X, current_qty, model, cfg)
-
-        if action == "hold":
-            logger.info("[runner] HOLD %s", sym)
-            summary["decisions"].append({
-                "symbol": sym,
-                "signal": "hold",
-                "risk_decision": "n/a",
-                "order_id": None,
-            })
+        current_qty = db_positions[held_sym]["qty"]
+        avg_entry = db_positions[held_sym]["avg_price"]
+        current_price = price_by_sym.get(held_sym, avg_entry)
+        if current_qty <= 0:
             continue
-
-        # Finalize quantity for buy using price + equity
-        if action == "buy":
-            desired_qty = max(1, floor(
-                float(cfg.get("risk", {}).get("max_position_pct", 0.10)) * equity / current_price
-            ))
-
-        # Risk check
+        logger.info("[runner] ROTATION: selling %s → target is %s", held_sym, target_sym)
         approved, approved_qty, reason = risk_mgr.check_order(
-            symbol=sym,
-            desired_qty=desired_qty,
-            side=action,
+            symbol=held_sym,
+            desired_qty=current_qty,
+            side="sell",
             current_price=current_price,
             equity=equity,
             daily_start_equity=daily_start_equity,
         )
-
-        decision_rec = {
-            "symbol": sym,
-            "signal": action,
-            "desired_qty": desired_qty,
-            "risk_decision": "approved" if approved else "rejected",
-            "reason": reason,
-            "order_id": None,
-        }
-
         if not approved:
-            logger.info("[runner] Order rejected: %s %s — %s", action, sym, reason)
-            summary["decisions"].append(decision_rec)
+            logger.warning("[runner] Rotation sell rejected for %s: %s", held_sym, reason)
             continue
-
-        # Submit order
         try:
-            order = broker.submit_order(sym, approved_qty, action)
-            decision_rec["order_id"] = order.id
-            logger.info(
-                "[runner] Order submitted: %s %d %s @ %.4f id=%s",
-                action, approved_qty, sym, current_price, order.id,
-            )
-
-            # Update SQLite state
-            if action == "buy":
-                new_qty = current_qty + approved_qty
-                new_avg = (
-                    (avg_entry * current_qty + current_price * approved_qty) / new_qty
-                    if new_qty > 0 else current_price
-                )
-                _upsert_position(sym, new_qty, new_avg)
-                _insert_trade(sym, "buy", approved_qty, current_price)
-                db_positions[sym] = {"qty": new_qty, "avg_price": new_avg}
-
-            elif action == "sell":
-                pnl = (current_price - avg_entry) * approved_qty
-                _insert_trade(sym, "sell", approved_qty, current_price, pnl=pnl)
-                remaining = current_qty - approved_qty
-                if remaining <= 0:
-                    _upsert_position(sym, 0, 0.0)
-                    db_positions.pop(sym, None)
-                else:
-                    _upsert_position(sym, remaining, avg_entry)
-                    db_positions[sym] = {"qty": remaining, "avg_price": avg_entry}
-
+            order = broker.submit_order(held_sym, approved_qty, "sell")
+            pnl = (current_price - avg_entry) * approved_qty
+            _insert_trade(held_sym, "sell", approved_qty, current_price, pnl=pnl)
+            _upsert_position(held_sym, 0, 0.0)
+            db_positions.pop(held_sym, None)
+            equity += pnl
             summary["orders_submitted"] += 1
-
+            summary["decisions"].append({
+                "symbol": held_sym,
+                "signal": "rotation_sell",
+                "risk_decision": "approved",
+                "order_id": order.id,
+            })
         except Exception as exc:
-            msg = f"Order submission failed: {action} {sym}: {exc}"
-            logger.error("[runner] %s", msg)
-            decision_rec["risk_decision"] = "order_failed"
-            decision_rec["error"] = str(exc)
-            summary["errors"].append(msg)
+            logger.error("[runner] Rotation sell failed for %s: %s", held_sym, exc)
+            summary["errors"].append(f"rotation sell {held_sym}: {exc}")
 
-        summary["decisions"].append(decision_rec)
+    # ── Stop-loss check on target position ───────────────────────────────
+    if target_sym and target_sym in db_positions:
+        current_qty = db_positions[target_sym]["qty"]
+        avg_entry = db_positions[target_sym]["avg_price"]
+        current_price = price_by_sym.get(target_sym, avg_entry)
+        if current_qty > 0 and avg_entry > 0 and risk_mgr.check_stop_loss(target_sym, current_price, avg_entry):
+            logger.warning("[runner] Stop-loss triggered for %s — selling", target_sym)
+            try:
+                order = broker.submit_order(target_sym, current_qty, "sell")
+                pnl = (current_price - avg_entry) * current_qty
+                _insert_trade(target_sym, "sell", current_qty, current_price, pnl=pnl)
+                _upsert_position(target_sym, 0, 0.0)
+                db_positions.pop(target_sym, None)
+                summary["orders_submitted"] += 1
+                summary["decisions"].append({
+                    "symbol": target_sym,
+                    "signal": "stop_loss",
+                    "risk_decision": "approved",
+                    "order_id": order.id,
+                })
+                target_sym = None  # Don't re-enter this cycle
+            except Exception as exc:
+                logger.error("[runner] Stop-loss order failed for %s: %s", target_sym, exc)
+                summary["errors"].append(f"stop_loss order {target_sym}: {exc}")
+
+    # ── ML-gated entry / exit for the target symbol ───────────────────────
+    if target_sym and target_sym in features_by_sym:
+        X = features_by_sym[target_sym]
+        current_price = price_by_sym[target_sym]
+        current_pos = db_positions.get(target_sym, {})
+        current_qty = current_pos.get("qty", 0)
+        avg_entry = current_pos.get("avg_price", 0.0)
+
+        # ML probability
+        try:
+            if model_type == "lstm":
+                from src.model_lstm import predict_proba
+                proba_arr = predict_proba(model, X)
+                proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
+            else:
+                from src.model import predict_proba
+                proba = float(predict_proba(model, X.tail(1))[0])
+        except Exception as exc:
+            logger.error("[runner] predict failed for %s: %s — holding", target_sym, exc)
+            proba = 0.5
+
+        # Regime
+        sma50_vs_sma200 = float(X["SMA50_VS_SMA200"].iloc[-1]) if "SMA50_VS_SMA200" in X.columns else 0.0
+        in_golden_cross = sma50_vs_sma200 > 0.0
+        in_death_cross  = sma50_vs_sma200 < -0.005
+        logger.info(
+            "[runner] %s p=%.4f golden=%s death=%s qty=%d",
+            target_sym, proba, in_golden_cross, in_death_cross, current_qty,
+        )
+
+        action: str | None = None
+        desired_qty = 0
+
+        if current_qty > 0 and (in_death_cross or proba < SELL_THRESHOLD):
+            action = "sell"
+            desired_qty = current_qty
+        elif current_qty == 0 and in_golden_cross and proba > BUY_THRESHOLD:
+            action = "buy"
+            desired_qty = max(1, floor(0.99 * equity / current_price))
+
+        if action:
+            approved, approved_qty, reason = risk_mgr.check_order(
+                symbol=target_sym,
+                desired_qty=desired_qty,
+                side=action,
+                current_price=current_price,
+                equity=equity,
+                daily_start_equity=daily_start_equity,
+            )
+            decision_rec = {
+                "symbol": target_sym,
+                "signal": action,
+                "desired_qty": desired_qty,
+                "risk_decision": "approved" if approved else "rejected",
+                "reason": reason,
+                "order_id": None,
+            }
+            if not approved:
+                logger.info("[runner] Order rejected: %s %s — %s", action, target_sym, reason)
+                summary["decisions"].append(decision_rec)
+            else:
+                try:
+                    order = broker.submit_order(target_sym, approved_qty, action)
+                    decision_rec["order_id"] = order.id
+                    logger.info(
+                        "[runner] Order submitted: %s %d %s @ %.4f id=%s",
+                        action, approved_qty, target_sym, current_price, order.id,
+                    )
+                    if action == "buy":
+                        new_qty = current_qty + approved_qty
+                        new_avg = (avg_entry * current_qty + current_price * approved_qty) / new_qty
+                        _upsert_position(target_sym, new_qty, new_avg)
+                        _insert_trade(target_sym, "buy", approved_qty, current_price)
+                        db_positions[target_sym] = {"qty": new_qty, "avg_price": new_avg}
+                    elif action == "sell":
+                        pnl = (current_price - avg_entry) * approved_qty
+                        _insert_trade(target_sym, "sell", approved_qty, current_price, pnl=pnl)
+                        remaining = current_qty - approved_qty
+                        if remaining <= 0:
+                            _upsert_position(target_sym, 0, 0.0)
+                            db_positions.pop(target_sym, None)
+                        else:
+                            _upsert_position(target_sym, remaining, avg_entry)
+                            db_positions[target_sym] = {"qty": remaining, "avg_price": avg_entry}
+                    summary["orders_submitted"] += 1
+                except Exception as exc:
+                    msg = f"Order submission failed: {action} {target_sym}: {exc}"
+                    logger.error("[runner] %s", msg)
+                    decision_rec["risk_decision"] = "order_failed"
+                    decision_rec["error"] = str(exc)
+                    summary["errors"].append(msg)
+            summary["decisions"].append(decision_rec)
+        else:
+            logger.info("[runner] HOLD %s (p=%.4f)", target_sym, proba)
+            summary["decisions"].append({
+                "symbol": target_sym,
+                "signal": "hold",
+                "risk_decision": "n/a",
+                "order_id": None,
+            })
 
     # ------------------------------------------------------------------
     # 7. Update equity log and peak tracker

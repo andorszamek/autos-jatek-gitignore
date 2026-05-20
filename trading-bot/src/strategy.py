@@ -89,3 +89,27 @@ def decide(
         return "buy", 1
 
     return "hold", 0
+
+
+def momentum_rank(features_by_sym: dict) -> "str | None":
+    """Return the symbol with highest composite momentum score.
+
+    Weighted blend of RET_60 (0.5) + RET_20 (0.3) + RET_5 (0.2).
+    Used for multi-asset rotation across SPY / QQQ / TLT / GLD.
+    Returns None if no valid features are provided.
+    """
+    scores: dict[str, float] = {}
+    for sym, X in features_by_sym.items():
+        if X is None or X.empty:
+            continue
+        score = 0.0
+        if "RET_60" in X.columns:
+            score += float(X["RET_60"].iloc[-1]) * 0.5
+        if "RET_20" in X.columns:
+            score += float(X["RET_20"].iloc[-1]) * 0.3
+        if "RET_5" in X.columns:
+            score += float(X["RET_5"].iloc[-1]) * 0.2
+        scores[sym] = score
+    if not scores:
+        return None
+    return max(scores, key=lambda s: scores[s])

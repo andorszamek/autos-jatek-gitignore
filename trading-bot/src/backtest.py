@@ -116,18 +116,19 @@ def _run_fold(
             return [], pd.Series(initial_cash, index=dates)
 
     # Extract cost parameters
-    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD
+    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank
 
     bcfg = cfg.get("backtest", {})
     commission = float(bcfg.get("commission", 0.0))
     slippage_pct = float(bcfg.get("slippage_pct", 0.0002))
     fx_cost_pct = float(bcfg.get("fx_cost_pct", 0.005))
-    max_pos_pct = float(cfg.get("risk", {}).get("max_position_pct", 0.10))
+    stop_loss_pct = float(cfg.get("risk", {}).get("stop_loss_pct", 0.03))
+    universe = cfg.get("universe", sorted(train_df["symbol"].unique().tolist()))
     buy_threshold = BUY_THRESHOLD
     sell_threshold = SELL_THRESHOLD
 
     cash = initial_cash
-    # positions: symbol -> {qty, avg_price}
+    # positions: symbol -> {qty, avg_price}  (at most 1 position held at a time)
     positions: dict[str, dict] = {}
     trades: list[dict] = []
 
@@ -139,24 +140,18 @@ def _run_fold(
     test_dates = sorted(test_df["timestamp"].dt.normalize().unique())
     equity_map: dict = {}
 
-    # We need enough look-back rows for features; for each test day, we combine
-    # the end of the train window with test rows so far
+    # Cumulative look-back buffer for feature building
     cumulative_df = train_df.copy()
 
     for test_date in test_dates:
-        # Rows for this date
         date_rows = test_df[test_df["timestamp"].dt.normalize() == test_date]
 
         if date_rows.empty:
-            # Carry forward equity
-            equity = _compute_equity(cash, positions, _last_prices(date_rows, test_df))
-            equity_map[test_date] = equity
+            equity_map[test_date] = _compute_equity(cash, positions, {})
             continue
 
-        # Append today's rows to cumulative for feature building
+        # Grow look-back buffer, trim to last 280 rows per symbol to cap memory
         cumulative_df = pd.concat([cumulative_df, date_rows], ignore_index=True)
-        # Keep only the last 280 rows per symbol (SMA200=200 + seq_len=60 + buffer=20)
-        # Prevents unbounded memory growth during long backtests
         if len(cumulative_df) > 300:
             cumulative_df = (
                 cumulative_df
@@ -165,126 +160,142 @@ def _run_fold(
                 .reset_index(drop=True)
             )
 
-        symbols_today = date_rows["symbol"].unique()
+        # ── Build features for every symbol present today ─────────────────
+        features_by_sym: dict[str, pd.DataFrame] = {}
+        price_by_sym: dict[str, float] = {}
 
-        for sym in symbols_today:
+        for sym in universe:
             sym_rows = date_rows[date_rows["symbol"] == sym]
             if sym_rows.empty:
                 continue
-
-            # Current bar's close price
-            current_price = float(sym_rows["close"].iloc[-1])
-            if current_price <= 0:
+            p = float(sym_rows["close"].iloc[-1])
+            if p <= 0:
                 continue
-
-            # Build features from cumulative data for this symbol
+            price_by_sym[sym] = p
             sym_cumulative = cumulative_df[cumulative_df["symbol"] == sym].copy()
-
             try:
                 X_feat, _ = build_features(sym_cumulative)
             except Exception:
                 continue
+            if not X_feat.empty:
+                features_by_sym[sym] = X_feat
 
-            if X_feat.empty:
+        if not features_by_sym:
+            equity_map[test_date] = _compute_equity(cash, positions, price_by_sym)
+            continue
+
+        # ── Dual-momentum rotation: pick best asset ────────────────────────
+        target_sym = momentum_rank(features_by_sym)
+
+        # ── Sell any position that is NOT the target (rotation exit) ───────
+        for held_sym in list(positions.keys()):
+            if held_sym == target_sym:
                 continue
+            p = price_by_sym.get(held_sym, positions[held_sym]["avg_price"])
+            qty = positions[held_sym]["qty"]
+            avg_e = positions[held_sym]["avg_price"]
+            exit_cost = _trade_cost(p, qty, commission, slippage_pct, fx_cost_pct)
+            pnl = (p - avg_e) * qty - exit_cost
+            cash += p * qty - exit_cost
+            del positions[held_sym]
+            trades.append({
+                "date": test_date,
+                "symbol": held_sym,
+                "side": "sell",
+                "qty": qty,
+                "price": p,
+                "cost": exit_cost,
+                "pnl": pnl,
+                "reason": "rotation",
+            })
 
-            # LSTM needs full sequence context; LightGBM uses last row only
+        # ── Manage the target symbol position ─────────────────────────────
+        if target_sym and target_sym in features_by_sym:
+            current_price = price_by_sym[target_sym]
+            X_target = features_by_sym[target_sym]
+            current_qty = positions.get(target_sym, {}).get("qty", 0)
+
+            # ML probability for target symbol
             if model_type == "lstm":
-                proba_arr = predict_proba(model, X_feat)
+                proba_arr = predict_proba(model, X_target)
                 proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
             else:
-                proba = float(predict_proba(model, X_feat.tail(1))[0])
+                proba = float(predict_proba(model, X_target.tail(1))[0])
 
-            # Regime signals (mirrors strategy.py logic)
+            # Regime check
             sma50_vs_sma200 = 0.0
-            if "SMA50_VS_SMA200" in X_feat.columns:
-                sma50_vs_sma200 = float(X_feat["SMA50_VS_SMA200"].iloc[-1])
+            if "SMA50_VS_SMA200" in X_target.columns:
+                sma50_vs_sma200 = float(X_target["SMA50_VS_SMA200"].iloc[-1])
             in_golden_cross = sma50_vs_sma200 > 0.0
             in_death_cross  = sma50_vs_sma200 < -0.005
 
-            stop_loss_pct = float(cfg.get("risk", {}).get("stop_loss_pct", 0.03))
-            current_qty = positions.get(sym, {}).get("qty", 0)
-            desired_side = None
+            desired_side: str | None = None
             desired_qty = 0
 
-            # Stop-loss (highest priority — matches live risk.py behaviour)
+            # Stop-loss (highest priority)
             if current_qty > 0:
-                entry_price = positions[sym]["avg_price"]
+                entry_price = positions[target_sym]["avg_price"]
                 if current_price < entry_price * (1 - stop_loss_pct):
                     desired_side = "sell"
                     desired_qty = current_qty
 
-            # Strategy signals (only if stop-loss didn't fire)
+            # ML + regime signals
             if desired_side is None:
-                # Exit: death cross OR ML bearish
                 if current_qty > 0 and (in_death_cross or proba < sell_threshold):
                     desired_side = "sell"
                     desired_qty = current_qty
-                # Entry: golden cross + ML not bearish
                 elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
                     desired_side = "buy"
-                    desired_qty = max(1, floor(max_pos_pct * cash / current_price))
+                    desired_qty = max(1, floor(cash / current_price * 0.99))  # use ~all cash
 
-            if desired_side is None or desired_qty < 1:
-                continue
-
-            if desired_side == "buy":
+            if desired_side == "buy" and desired_qty >= 1:
                 cost = current_price * desired_qty + _trade_cost(
                     current_price, desired_qty, commission, slippage_pct, fx_cost_pct
                 )
                 if cost > cash:
-                    # Reduce qty to what cash allows
-                    # (cost per share = price + slippage_pct*price + fx_cost_pct*price)
                     cost_per_share = current_price * (1 + slippage_pct + fx_cost_pct)
                     desired_qty = max(0, floor((cash - commission) / cost_per_share))
                     if desired_qty < 1:
-                        continue
-                    cost = current_price * desired_qty + _trade_cost(
-                        current_price, desired_qty, commission, slippage_pct, fx_cost_pct
-                    )
+                        desired_side = None
+                    else:
+                        cost = current_price * desired_qty + _trade_cost(
+                            current_price, desired_qty, commission, slippage_pct, fx_cost_pct
+                        )
+                if desired_side and desired_qty >= 1:
+                    entry_cost = _trade_cost(current_price, desired_qty, commission, slippage_pct, fx_cost_pct)
+                    cash -= cost
+                    positions[target_sym] = {"qty": desired_qty, "avg_price": current_price}
+                    trades.append({
+                        "date": test_date,
+                        "symbol": target_sym,
+                        "side": "buy",
+                        "qty": desired_qty,
+                        "price": current_price,
+                        "cost": entry_cost,
+                        "pnl": 0.0,
+                        "reason": "entry",
+                    })
 
-                cash -= cost
-                avg_price = current_price
-                entry_cost = _trade_cost(current_price, desired_qty, commission, slippage_pct, fx_cost_pct)
-                positions[sym] = {"qty": desired_qty, "avg_price": avg_price}
-                trades.append({
-                    "date": test_date,
-                    "symbol": sym,
-                    "side": "buy",
-                    "qty": desired_qty,
-                    "price": current_price,
-                    "cost": entry_cost,
-                    "pnl": 0.0,
-                })
-
-            elif desired_side == "sell" and sym in positions:
-                qty = positions[sym]["qty"]
-                avg_entry = positions[sym]["avg_price"]
+            elif desired_side == "sell" and target_sym in positions:
+                qty = positions[target_sym]["qty"]
+                avg_entry = positions[target_sym]["avg_price"]
                 exit_cost = _trade_cost(current_price, qty, commission, slippage_pct, fx_cost_pct)
-                gross_proceeds = current_price * qty
-                net_proceeds = gross_proceeds - exit_cost
                 pnl = (current_price - avg_entry) * qty - exit_cost
-                # Also subtract entry cost from PnL (already paid at buy time)
-                cash += net_proceeds
-                del positions[sym]
+                cash += current_price * qty - exit_cost
+                del positions[target_sym]
                 trades.append({
                     "date": test_date,
-                    "symbol": sym,
+                    "symbol": target_sym,
                     "side": "sell",
                     "qty": qty,
                     "price": current_price,
                     "cost": exit_cost,
                     "pnl": pnl,
+                    "reason": "signal",
                 })
 
-        # Compute equity for this date
-        price_map = {sym: float(test_df[test_df["symbol"] == sym]["close"].iloc[-1])
-                     for sym in test_df["symbol"].unique()}
-        equity = cash + sum(
-            pos["qty"] * price_map.get(sym, pos["avg_price"])
-            for sym, pos in positions.items()
-        )
-        equity_map[test_date] = equity
+        # ── Mark-to-market equity ─────────────────────────────────────────
+        equity_map[test_date] = _compute_equity(cash, positions, price_by_sym)
 
     if not equity_map:
         dates = _extract_dates(test_df)
@@ -419,8 +430,9 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
     oos_start = pd.Timestamp(oos_dates[0]) - pd.Timedelta(days=1)
     oos_equity = pd.concat([pd.Series({oos_start: initial_capital}), oos_equity_raw]).sort_index()
 
-    # ---- Buy-and-hold benchmark ----
-    sym_df = df[df["symbol"] == df["symbol"].unique()[0]].sort_values("timestamp")
+    # ---- Buy-and-hold benchmark (SPY, or first symbol if SPY not present) ----
+    bench_sym = "SPY" if "SPY" in df["symbol"].unique() else df["symbol"].unique()[0]
+    sym_df = df[df["symbol"] == bench_sym].sort_values("timestamp")
     bench_prices = sym_df.groupby(sym_df["timestamp"].dt.normalize())["close"].last()
 
     def _bh_equity(dates, cap):

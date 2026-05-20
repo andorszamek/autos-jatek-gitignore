@@ -1,4 +1,4 @@
-universe: ["SPY"]
+universe: ["SPY", "QQQ", "TLT", "GLD"]
 timeframe: "1Day"
 initial_capital: 1000
 history_days: 1500
