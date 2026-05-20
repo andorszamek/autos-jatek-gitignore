@@ -2,10 +2,12 @@
 """Train the ML model on historical data.
 
 Usage:
-    python scripts/train.py [--symbols SPY] [--days 1500]
+    python scripts/train.py [--model lstm|lgbm] [--symbols SPY] [--days N]
 
-Loads data from data/, builds features, trains LightGBM, saves model to models/.
-Run this on a Mac/desktop — not needed on the Raspberry Pi.
+LSTM (default): downloads 7500 days (~30 years), trains on Mac with MPS.
+LightGBM:       legacy tabular model, 1500 days.
+
+Saves model to models/latest.lstm (or .lgb).
 """
 import argparse
 import sys
@@ -16,10 +18,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Train the LightGBM model. Run on Mac, not on Raspberry Pi.",
+        description="Train ML model for SPY directional prediction.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--model", choices=["lstm", "lgbm"], default="lstm",
+                        help="Model architecture (default: lstm)")
     parser.add_argument("--symbols", nargs="+", help="Override universe symbols")
     parser.add_argument("--days", type=int, help="Override history_days")
     args = parser.parse_args()
@@ -28,11 +32,16 @@ def main() -> None:
     cfg = load_config()
 
     symbols = args.symbols or cfg["universe"]
-    days = args.days or cfg["history_days"]
+
+    if args.model == "lstm":
+        from src.model_lstm import train, save
+        days = args.days or max(int(cfg.get("history_days", 1500)), 7500)
+    else:
+        from src.model import train, save
+        days = args.days or int(cfg.get("history_days", 1500))
 
     from src.data_loader import load_history
     from src.features import build_features
-    from src.model import train, save
 
     print(f"Loading data for {symbols} ({days} days)...")
     df = load_history(symbols=symbols, timeframe=cfg["timeframe"], days=days, cfg=cfg)
@@ -40,8 +49,8 @@ def main() -> None:
     print("Building features...")
     X, y = build_features(df)
 
-    print(f"Training on {len(X)} samples...")
-    model = train(X, y)
+    print(f"Training [{args.model.upper()}] on {len(X)} samples...")
+    model = train(X, y, cfg)
 
     output_dir = Path(__file__).resolve().parent.parent / "models"
     output_dir.mkdir(exist_ok=True)

@@ -84,7 +84,12 @@ def _run_fold(
 ) -> tuple[list[dict], pd.Series]:
     """Run one walk-forward fold. Returns (trades, equity_series)."""
     from src.features import build_features
-    from src.model import train as model_train, predict_proba
+
+    model_type = cfg.get("_model_type", "lgbm")
+    if model_type == "lstm":
+        from src.model_lstm import train as model_train, predict_proba
+    else:
+        from src.model import train as model_train, predict_proba
 
     # Build features for this fold
     try:
@@ -172,9 +177,12 @@ def _run_fold(
             if X_feat.empty:
                 continue
 
-            # Use last row for inference
-            X_last = X_feat.tail(1)
-            proba = predict_proba(model, X_last)[0]
+            # LSTM needs full sequence context; LightGBM uses last row only
+            if model_type == "lstm":
+                proba_arr = predict_proba(model, X_feat)
+                proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
+            else:
+                proba = float(predict_proba(model, X_feat.tail(1))[0])
 
             current_qty = positions.get(sym, {}).get("qty", 0)
             desired_side = None

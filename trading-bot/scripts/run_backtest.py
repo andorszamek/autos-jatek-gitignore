@@ -2,11 +2,12 @@
 """Run walk-forward backtest and generate report.
 
 Usage:
-    python scripts/run_backtest.py [--no-costs]
+    python scripts/run_backtest.py [--model lstm|lgbm] [--no-costs] [--refresh]
+
+LSTM (default): trains an LSTM per fold — takes ~5-15 min on M3 Mac.
+LightGBM:       legacy tabular model, runs in seconds.
 
 Outputs equity curve CSV and metrics to logs/backtest_<timestamp>/.
-Always includes commission, slippage, and FX costs unless --no-costs is given
-(use --no-costs only for sanity comparison, not for real evaluation).
 """
 import argparse
 import sys
@@ -21,10 +22,12 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
+    parser.add_argument("--model", choices=["lstm", "lgbm"], default="lstm",
+                        help="Model architecture (default: lstm)")
     parser.add_argument(
         "--no-costs",
         action="store_true",
-        help="Disable cost modelling (sanity check only — not for real evaluation)",
+        help="Disable cost modelling (sanity check only)",
     )
     parser.add_argument(
         "--refresh",
@@ -36,8 +39,10 @@ def main() -> None:
     from src.config import load_config
     cfg = load_config()
 
+    cfg["_model_type"] = args.model
+
     if args.no_costs:
-        print("WARNING: running WITHOUT costs — this is for sanity comparison only.")
+        print("WARNING: running WITHOUT costs — sanity comparison only.")
         cfg["backtest"]["commission"] = 0.0
         cfg["backtest"]["slippage_pct"] = 0.0
         cfg["backtest"]["fx_cost_pct"] = 0.0
@@ -46,7 +51,11 @@ def main() -> None:
     from src.backtest import run_backtest
 
     symbols = cfg["universe"]
-    days = cfg["history_days"]
+    # LSTM needs more history for sufficient training sequences
+    if args.model == "lstm":
+        days = max(int(cfg.get("history_days", 1500)), 7500)
+    else:
+        days = int(cfg.get("history_days", 1500))
 
     print(f"Loading data for backtest: {symbols}, {days} days...")
     df = load_history(
@@ -57,7 +66,7 @@ def main() -> None:
         force_refresh=args.refresh,
     )
 
-    print("Running backtest...")
+    print(f"Running backtest [{args.model.upper()}]...")
     results = run_backtest(df, cfg)
     print("Backtest complete. Report saved to logs/.")
 
