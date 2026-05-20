@@ -220,35 +220,47 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     }
 
     # ------------------------------------------------------------------
-    # 1. Load model (prefer LSTM if available, fall back to LightGBM)
+    # 1. Load per-symbol models (prefer LSTM, fall back to LightGBM;
+    #    per-symbol file first, generic latest.* as fallback)
     # ------------------------------------------------------------------
-    lstm_path = _MODELS_DIR / "latest.lstm"
-    lgbm_path = _MODELS_DIR / "latest.lgb"
+    models_by_sym: dict = {}
+    model_type = "lgbm"
 
-    if lstm_path.exists():
-        model_path = lstm_path
+    _has_lstm = (_MODELS_DIR / "latest.lstm").exists() or any(
+        (_MODELS_DIR / f"latest_{s}.lstm").exists() for s in symbols
+    )
+    if _has_lstm:
         model_type = "lstm"
-    elif lgbm_path.exists():
-        model_path = lgbm_path
-        model_type = "lgbm"
+        from src.model_lstm import load as _load_model
+    elif (_MODELS_DIR / "latest.lgb").exists() or any(
+        (_MODELS_DIR / f"latest_{s}.lgb").exists() for s in symbols
+    ):
+        from src.model import load as _load_model
     else:
         msg = f"No model found in {_MODELS_DIR}. Run scripts/train.py first."
         logger.error("[runner] %s", msg)
         summary["errors"].append(msg)
         return summary
 
-    try:
-        if model_type == "lstm":
-            from src.model_lstm import load as model_load
-        else:
-            from src.model import load as model_load
-        model = model_load(str(model_path))
-        logger.info("[runner] Model loaded from %s (type=%s)", model_path, model_type)
-    except Exception as exc:
-        msg = f"Failed to load model: {exc}"
+    ext = "lstm" if model_type == "lstm" else "lgb"
+    for sym in symbols:
+        sym_path     = _MODELS_DIR / f"latest_{sym}.{ext}"
+        generic_path = _MODELS_DIR / f"latest.{ext}"
+        path = sym_path if sym_path.exists() else (generic_path if generic_path.exists() else None)
+        if path:
+            try:
+                models_by_sym[sym] = _load_model(str(path))
+                logger.info("[runner] Model for %s loaded: %s", sym, path.name)
+            except Exception as exc:
+                logger.warning("[runner] Failed to load model for %s: %s", sym, exc)
+
+    if not models_by_sym:
+        msg = f"No usable model in {_MODELS_DIR}. Run scripts/train.py first."
         logger.error("[runner] %s", msg)
         summary["errors"].append(msg)
         return summary
+
+    logger.info("[runner] Models loaded: %d/%d symbols (type=%s)", len(models_by_sym), len(symbols), model_type)
 
     # ------------------------------------------------------------------
     # 2. Create broker
@@ -442,18 +454,20 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
         current_qty = current_pos.get("qty", 0)
         avg_entry = current_pos.get("avg_price", 0.0)
 
-        # ML probability
-        try:
-            if model_type == "lstm":
-                from src.model_lstm import predict_proba
-                proba_arr = predict_proba(model, X)
-                proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
-            else:
-                from src.model import predict_proba
-                proba = float(predict_proba(model, X.tail(1))[0])
-        except Exception as exc:
-            logger.error("[runner] predict failed for %s: %s — holding", target_sym, exc)
-            proba = 0.5
+        # ML probability — use per-symbol model
+        model_for_sym = models_by_sym.get(target_sym)
+        proba = 0.5
+        if model_for_sym is not None:
+            try:
+                if model_type == "lstm":
+                    from src.model_lstm import predict_proba
+                    proba_arr = predict_proba(model_for_sym, X)
+                    proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
+                else:
+                    from src.model import predict_proba
+                    proba = float(predict_proba(model_for_sym, X.tail(1))[0])
+            except Exception as exc:
+                logger.error("[runner] predict failed for %s: %s — using 0.5", target_sym, exc)
 
         # Regime
         sma50_vs_sma200 = float(X["SMA50_VS_SMA200"].iloc[-1]) if "SMA50_VS_SMA200" in X.columns else 0.0

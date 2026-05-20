@@ -218,16 +218,19 @@ def train(X: pd.DataFrame, y: pd.Series, cfg: dict[str, Any] | None = None) -> L
     return LSTMModel(net, scaler, SEQ_LEN, n_features, device)
 
 
-def save(model: LSTMModel, output_dir: str) -> None:
-    """Save model to <output_dir>/<timestamp>_model.lstm and copy to latest.lstm."""
+def save(model: LSTMModel, output_dir: str, suffix: str = "") -> None:
+    """Save model to <output_dir>/<timestamp>_model<suffix>.lstm and latest<suffix>.lstm.
+
+    suffix: e.g. "_SPY" for per-symbol models; empty string for generic model.
+    """
     import torch
 
     out = Path(output_dir)
     out.mkdir(parents=True, exist_ok=True)
 
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    versioned = out / f"{ts}_model.lstm"
-    latest = out / "latest.lstm"
+    versioned = out / f"{ts}_model{suffix}.lstm"
+    latest = out / f"latest{suffix}.lstm"
 
     torch.save(
         {

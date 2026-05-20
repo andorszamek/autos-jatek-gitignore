@@ -81,39 +81,52 @@ def _run_fold(
     test_df: pd.DataFrame,
     cfg: dict[str, Any],
     initial_cash: float,
-    pretrained_model=None,
+    pretrained_models: "dict | None" = None,
 ) -> tuple[list[dict], pd.Series]:
     """Run one walk-forward fold. Returns (trades, equity_series)."""
     from src.features import build_features
 
+    strategy  = cfg.get("_strategy", "ml")
     model_type = cfg.get("_model_type", "lgbm")
-    if model_type == "lstm":
-        from src.model_lstm import train as model_train, predict_proba
-    else:
-        from src.model import train as model_train, predict_proba
+    universe  = cfg.get("universe", sorted(train_df["symbol"].unique().tolist()))
 
-    if pretrained_model is not None:
-        model = pretrained_model
-    else:
-        # Build features and train fresh model for this fold
-        try:
-            X_train, y_train = build_features(train_df)
-        except Exception as exc:
-            logger.warning("[backtest] Fold train feature build failed: %s", exc)
-            dates = _extract_dates(test_df)
-            return [], pd.Series(initial_cash, index=dates)
+    # ── Model setup (skipped entirely for pure momentum strategy) ─────────
+    models_by_sym: dict = {}
+    predict_proba = None  # set below if needed
 
-        if y_train is None or len(X_train) < 20:
-            logger.warning("[backtest] Fold: not enough training data (%d rows)", len(X_train))
-            dates = _extract_dates(test_df)
-            return [], pd.Series(initial_cash, index=dates)
+    if strategy == "ml":
+        if model_type == "lstm":
+            from src.model_lstm import train as _train, predict_proba
+        else:
+            from src.model import train as _train, predict_proba
 
-        try:
-            model = model_train(X_train, y_train, cfg)
-        except Exception as exc:
-            logger.warning("[backtest] Fold model training failed: %s", exc)
-            dates = _extract_dates(test_df)
-            return [], pd.Series(initial_cash, index=dates)
+        if pretrained_models is not None:
+            models_by_sym = pretrained_models
+        elif model_type == "lstm":
+            # Per-symbol LSTM training for this fold
+            for sym in universe:
+                sym_train = train_df[train_df["symbol"] == sym].copy()
+                try:
+                    X_s, y_s = build_features(sym_train)
+                except Exception as exc:
+                    logger.warning("[backtest] Feature build for %s: %s", sym, exc)
+                    continue
+                if y_s is None or len(X_s) < 20:
+                    logger.warning("[backtest] Not enough data for %s (%d rows)", sym, len(X_s))
+                    continue
+                try:
+                    models_by_sym[sym] = _train(X_s, y_s, cfg)
+                except Exception as exc:
+                    logger.warning("[backtest] Training failed for %s: %s", sym, exc)
+        else:
+            # Single lgbm model trained on all symbols combined
+            try:
+                X_train, y_train = build_features(train_df)
+                if y_train is not None and len(X_train) >= 20:
+                    single_model = _train(X_train, y_train, cfg)
+                    models_by_sym = {sym: single_model for sym in universe}
+            except Exception as exc:
+                logger.warning("[backtest] lgbm fold training failed: %s", exc)
 
     # Extract cost parameters
     from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank, momentum_score
@@ -241,13 +254,6 @@ def _run_fold(
             X_target = features_by_sym[target_sym]
             current_qty = positions.get(target_sym, {}).get("qty", 0)
 
-            # ML probability for target symbol
-            if model_type == "lstm":
-                proba_arr = predict_proba(model, X_target)
-                proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
-            else:
-                proba = float(predict_proba(model, X_target.tail(1))[0])
-
             # Regime check
             sma50_vs_sma200 = 0.0
             if "SMA50_VS_SMA200" in X_target.columns:
@@ -265,14 +271,35 @@ def _run_fold(
                     desired_side = "sell"
                     desired_qty = current_qty
 
-            # ML + regime signals
+            # Entry / exit signals
             if desired_side is None:
-                if current_qty > 0 and (in_death_cross or proba < sell_threshold):
-                    desired_side = "sell"
-                    desired_qty = current_qty
-                elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
-                    desired_side = "buy"
-                    desired_qty = max(1, floor(cash / current_price * 0.99))  # use ~all cash
+                if strategy == "momentum":
+                    # Pure regime: golden cross in, death cross out — no ML
+                    if current_qty > 0 and in_death_cross:
+                        desired_side = "sell"
+                        desired_qty = current_qty
+                    elif current_qty == 0 and in_golden_cross:
+                        desired_side = "buy"
+                        desired_qty = max(1, floor(cash / current_price * 0.99))
+                else:
+                    # ML timing: per-symbol model
+                    model_for_sym = models_by_sym.get(target_sym)
+                    proba = 0.5
+                    if model_for_sym is not None and predict_proba is not None:
+                        try:
+                            if model_type == "lstm":
+                                proba_arr = predict_proba(model_for_sym, X_target)
+                                proba = float(proba_arr[-1]) if len(proba_arr) > 0 else 0.5
+                            else:
+                                proba = float(predict_proba(model_for_sym, X_target.tail(1))[0])
+                        except Exception as exc:
+                            logger.warning("[backtest] predict failed for %s: %s", target_sym, exc)
+                    if current_qty > 0 and (in_death_cross or proba < sell_threshold):
+                        desired_side = "sell"
+                        desired_qty = current_qty
+                    elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
+                        desired_side = "buy"
+                        desired_qty = max(1, floor(cash / current_price * 0.99))
 
             if desired_side == "buy" and desired_qty >= 1:
                 cost = current_price * desired_qty + _trade_cost(
@@ -392,17 +419,26 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
         n_dev, n_oos, oos_fraction * 100,
     )
 
-    # Load pre-trained model if --use-saved (skips per-fold training)
-    pretrained = None
-    if cfg.get("_use_saved_model"):
+    # Load pre-trained per-symbol models if --use-saved
+    pretrained: dict | None = None
+    strategy = cfg.get("_strategy", "ml")
+    if cfg.get("_use_saved_model") and strategy == "ml":
         model_type = cfg.get("_model_type", "lgbm")
-        model_path = str(_ROOT / "models" / ("latest.lstm" if model_type == "lstm" else "latest.lgb"))
+        ext = "lstm" if model_type == "lstm" else "lgb"
         if model_type == "lstm":
             from src.model_lstm import load as _load_model
         else:
             from src.model import load as _load_model
-        pretrained = _load_model(model_path)
-        print(f"[backtest] Using pre-trained model: {model_path}")
+        pretrained = {}
+        for sym in cfg.get("universe", []):
+            sym_path    = _ROOT / "models" / f"latest_{sym}.{ext}"
+            generic_path = _ROOT / "models" / f"latest.{ext}"
+            path = sym_path if sym_path.exists() else (generic_path if generic_path.exists() else None)
+            if path:
+                pretrained[sym] = _load_model(str(path))
+                print(f"[backtest] Loaded model for {sym}: {path.name}")
+            else:
+                print(f"[backtest] WARNING: no model for {sym} — will use proba=0.5")
 
     # ---- Walk-forward on development data ----
     fold_size = n_dev // n_folds
@@ -434,7 +470,7 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
             fold_idx, len(train_df), len(test_df),
         )
 
-        fold_trades, fold_equity = _run_fold(train_df, test_df, cfg, current_equity, pretrained_model=pretrained)
+        fold_trades, fold_equity = _run_fold(train_df, test_df, cfg, current_equity, pretrained_models=pretrained)
         all_trades.extend(fold_trades)
         equity_segments.append(fold_equity)
         if not fold_equity.empty:
@@ -451,7 +487,7 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
     print("\n[backtest] Running true OOS evaluation on held-out period...")
     oos_train_df = df[df["timestamp"].dt.normalize().isin(set(dev_dates))].copy()
     oos_test_df = df[df["timestamp"].dt.normalize().isin(set(oos_dates))].copy()
-    oos_trades, oos_equity_raw = _run_fold(oos_train_df, oos_test_df, cfg, initial_capital, pretrained_model=pretrained)
+    oos_trades, oos_equity_raw = _run_fold(oos_train_df, oos_test_df, cfg, initial_capital, pretrained_models=pretrained)
 
     oos_start = pd.Timestamp(oos_dates[0]) - pd.Timedelta(days=1)
     oos_equity = pd.concat([pd.Series({oos_start: initial_capital}), oos_equity_raw]).sort_index()

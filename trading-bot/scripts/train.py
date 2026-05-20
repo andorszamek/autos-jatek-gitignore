@@ -46,16 +46,27 @@ def main() -> None:
     print(f"Loading data for {symbols} ({days} days)...")
     df = load_history(symbols=symbols, timeframe=cfg["timeframe"], days=days, cfg=cfg)
 
-    print("Building features...")
-    X, y = build_features(df)
-
-    print(f"Training [{args.model.upper()}] on {len(X)} samples...")
-    model = train(X, y, cfg)
-
     output_dir = Path(__file__).resolve().parent.parent / "models"
     output_dir.mkdir(exist_ok=True)
-    save(model, str(output_dir))
-    print("Model saved to models/")
+
+    if args.model == "lstm":
+        # Train one LSTM per symbol so each model learns symbol-specific dynamics
+        for sym in symbols:
+            print(f"\n{'=' * 55}")
+            print(f"  Building features for {sym}...")
+            sym_df = df[df["symbol"] == sym]
+            X_sym, y_sym = build_features(sym_df)
+            print(f"  Training LSTM for {sym} ({len(X_sym)} samples)...")
+            model = train(X_sym, y_sym, cfg)
+            save(model, str(output_dir), suffix=f"_{sym}")
+            print(f"  Saved → models/latest_{sym}.lstm")
+    else:
+        print("Building features...")
+        X, y = build_features(df)
+        print(f"Training [LGBM] on {len(X)} samples...")
+        model = train(X, y, cfg)
+        save(model, str(output_dir))
+        print("Model saved to models/")
 
 
 if __name__ == "__main__":

@@ -26,6 +26,8 @@ def main() -> None:
                         help="Model architecture (default: lstm)")
     parser.add_argument("--use-saved", action="store_true",
                         help="Use pre-trained model from models/ (fast — no per-fold training)")
+    parser.add_argument("--strategy", choices=["ml", "momentum"], default="ml",
+                        help="ml: LSTM/LightGBM timing (default); momentum: pure regime, no ML")
     parser.add_argument(
         "--no-costs",
         action="store_true",
@@ -43,6 +45,7 @@ def main() -> None:
 
     cfg["_model_type"] = args.model
     cfg["_use_saved_model"] = args.use_saved
+    cfg["_strategy"] = args.strategy
 
     if args.no_costs:
         print("WARNING: running WITHOUT costs — sanity comparison only.")
