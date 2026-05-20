@@ -316,7 +316,7 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     # 6. Build features for all symbols → momentum rank → rotate
     # ------------------------------------------------------------------
     from src.features import build_features
-    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank
+    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank, momentum_score
 
     features_by_sym: dict[str, object] = {}
     price_by_sym: dict[str, float] = {}
@@ -340,9 +340,28 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
         summary["errors"].append("No features built for any symbol")
         return summary
 
-    # Dual-momentum: pick top-ranked asset
-    target_sym = momentum_rank(features_by_sym)
-    logger.info("[runner] Momentum target: %s", target_sym)
+    # Dual-momentum: weekly rotation (Mondays) with 2% improvement threshold.
+    # On non-rotation days, keep the currently held symbol as target.
+    from datetime import date as _date
+    is_rotation_day = _date.today().weekday() == 0  # Monday
+
+    held_syms = [s for s, p in db_positions.items() if p.get("qty", 0) > 0]
+    currently_held = held_syms[0] if held_syms else None
+
+    if is_rotation_day or currently_held is None:
+        new_target = momentum_rank(features_by_sym)
+        if currently_held is None or currently_held not in features_by_sym:
+            target_sym = new_target
+        elif new_target is not None and new_target != currently_held:
+            curr_s = momentum_score(features_by_sym.get(currently_held))
+            new_s  = momentum_score(features_by_sym.get(new_target))
+            target_sym = new_target if new_s > curr_s * 1.02 else currently_held
+        else:
+            target_sym = currently_held
+    else:
+        target_sym = currently_held  # Hold through the week, ML can still exit
+
+    logger.info("[runner] Rotation day=%s target=%s held=%s", is_rotation_day, target_sym, currently_held)
 
     # ── Rotation: sell any held position that is NOT the target ──────────
     for held_sym in list(db_positions.keys()):

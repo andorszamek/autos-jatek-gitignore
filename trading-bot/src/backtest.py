@@ -116,7 +116,7 @@ def _run_fold(
             return [], pd.Series(initial_cash, index=dates)
 
     # Extract cost parameters
-    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank
+    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD, momentum_rank, momentum_score
 
     bcfg = cfg.get("backtest", {})
     commission = float(bcfg.get("commission", 0.0))
@@ -142,6 +142,10 @@ def _run_fold(
 
     # Cumulative look-back buffer for feature building
     cumulative_df = train_df.copy()
+
+    # Weekly rotation state: re-rank every ~5 trading days, switch only if 2% better
+    last_rotation_date: "pd.Timestamp | None" = None
+    committed_target: "str | None" = None  # symbol we've committed to hold this week
 
     for test_date in test_dates:
         date_rows = test_df[test_df["timestamp"].dt.normalize() == test_date]
@@ -184,8 +188,23 @@ def _run_fold(
             equity_map[test_date] = _compute_equity(cash, positions, price_by_sym)
             continue
 
-        # ── Dual-momentum rotation: pick best asset ────────────────────────
-        target_sym = momentum_rank(features_by_sym)
+        # ── Weekly rotation check (every ≥5 trading days, 2% improvement threshold) ─
+        is_rotation_day = (
+            last_rotation_date is None
+            or (test_date - last_rotation_date).days >= 5
+        )
+        if is_rotation_day:
+            new_target = momentum_rank(features_by_sym)
+            if committed_target is None or committed_target not in features_by_sym:
+                committed_target = new_target
+            elif new_target is not None and new_target != committed_target:
+                curr_s = momentum_score(features_by_sym.get(committed_target))
+                new_s  = momentum_score(features_by_sym.get(new_target))
+                if new_s > curr_s * 1.02:
+                    committed_target = new_target
+            last_rotation_date = test_date
+
+        target_sym = committed_target
 
         # ── Sell any position that is NOT the target (rotation exit) ───────
         for held_sym in list(positions.keys()):
