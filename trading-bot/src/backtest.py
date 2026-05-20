@@ -195,16 +195,25 @@ def _run_fold(
             else:
                 proba = float(predict_proba(model, X_feat.tail(1))[0])
 
+            # Regime signals (mirrors strategy.py logic)
+            sma50_vs_sma200 = 0.0
+            if "SMA50_VS_SMA200" in X_feat.columns:
+                sma50_vs_sma200 = float(X_feat["SMA50_VS_SMA200"].iloc[-1])
+            in_golden_cross = sma50_vs_sma200 > 0.0
+            in_death_cross  = sma50_vs_sma200 < -0.005
+
             current_qty = positions.get(sym, {}).get("qty", 0)
             desired_side = None
             desired_qty = 0
 
-            if proba > buy_threshold and current_qty == 0:
-                desired_side = "buy"
-                desired_qty = max(1, floor(max_pos_pct * cash / current_price))
-            elif proba < sell_threshold and current_qty > 0:
+            # Exit: death cross OR ML bearish
+            if current_qty > 0 and (in_death_cross or proba < sell_threshold):
                 desired_side = "sell"
                 desired_qty = current_qty
+            # Entry: golden cross + ML not bearish
+            elif current_qty == 0 and in_golden_cross and proba > buy_threshold:
+                desired_side = "buy"
+                desired_qty = max(1, floor(max_pos_pct * cash / current_price))
 
             if desired_side is None or desired_qty < 1:
                 continue
