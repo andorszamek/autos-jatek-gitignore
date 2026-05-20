@@ -1,0 +1,12 @@
+# Raspberry Pi runtime dependencies — inference only, no training
+# Install: pip install -r requirements_pi.txt
+python-dotenv>=1.0.0
+pyyaml>=6.0
+alpaca-py>=0.20.0
+pandas>=2.0.0
+pyarrow>=14.0.0
+yfinance>=0.2.36
+numpy>=1.26.0
+requests>=2.31.0
+scikit-learn>=1.4.0       # StandardScaler used by LSTM wrapper
+torch>=2.0.0              # CPU-only inference; no GPU needed on Pi
