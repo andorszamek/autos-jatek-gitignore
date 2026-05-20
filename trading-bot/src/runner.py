@@ -219,6 +219,8 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
         "errors": [],
     }
 
+    symbols: list[str] = cfg.get("universe", [])
+
     # ------------------------------------------------------------------
     # 1. Load per-symbol models (prefer LSTM, fall back to LightGBM;
     #    per-symbol file first, generic latest.* as fallback)
@@ -282,7 +284,6 @@ def run_cycle(cfg: dict[str, Any], risk_flag: bool = False) -> dict[str, Any]:
     # 3. Sync positions: broker vs SQLite
     # ------------------------------------------------------------------
     db_positions = _load_positions_from_db()
-    symbols: list[str] = cfg.get("universe", [])
 
     broker_positions: dict[str, dict] = {}
     for sym in symbols:
