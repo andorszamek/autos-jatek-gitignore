@@ -275,4 +275,7 @@ def predict_proba(model: LSTMModel, X: pd.DataFrame) -> np.ndarray:
     with torch.no_grad():
         proba = model.net(torch.tensor(xs, device=model.device)).cpu().numpy()
 
+    if str(model.device) == "mps":
+        torch.mps.empty_cache()
+
     return np.asarray(proba, dtype=float)

@@ -155,6 +155,15 @@ def _run_fold(
 
         # Append today's rows to cumulative for feature building
         cumulative_df = pd.concat([cumulative_df, date_rows], ignore_index=True)
+        # Keep only the last 280 rows per symbol (SMA200=200 + seq_len=60 + buffer=20)
+        # Prevents unbounded memory growth during long backtests
+        if len(cumulative_df) > 300:
+            cumulative_df = (
+                cumulative_df
+                .groupby("symbol", group_keys=False)
+                .tail(280)
+                .reset_index(drop=True)
+            )
 
         symbols_today = date_rows["symbol"].unique()
 
