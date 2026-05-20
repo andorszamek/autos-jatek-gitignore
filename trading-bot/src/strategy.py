@@ -4,8 +4,8 @@ decide() converts a model probability + trend filter into a trading action.
 The risk module finalises the actual order quantity.
 
 Thresholds:
-  BUY_THRESHOLD  = 0.52  (was 0.55 — trades much more frequently)
-  SELL_THRESHOLD = 0.48  (was 0.45)
+  BUY_THRESHOLD  = 0.52
+  SELL_THRESHOLD = 0.48
 
 Trend filter (PRICE_VS_SMA200):
   Only enter long when price is above the 200-day SMA (bull regime).
@@ -18,8 +18,8 @@ import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BUY_THRESHOLD  = 0.505
-SELL_THRESHOLD = 0.495
+BUY_THRESHOLD  = 0.52
+SELL_THRESHOLD = 0.48
 
 
 def decide(

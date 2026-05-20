@@ -110,8 +110,8 @@ def _build_symbol_features(df: pd.DataFrame) -> pd.DataFrame:
     vol_ma20 = volume.rolling(20, min_periods=20).mean()
     out["VOL_RATIO"] = volume / vol_ma20
 
-    # --- Target ---
-    next_close = close.shift(-1)
+    # --- Target: 5-day forward return (less noisy than 1-day) ---
+    next_close = close.shift(-5)
     out[TARGET_COLUMN] = np.where(
         next_close.notna(),
         (next_close > close).astype(float),

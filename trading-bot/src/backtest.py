@@ -109,13 +109,15 @@ def _run_fold(
         return [], pd.Series(initial_cash, index=dates)
 
     # Extract cost parameters
+    from src.strategy import BUY_THRESHOLD, SELL_THRESHOLD
+
     bcfg = cfg.get("backtest", {})
     commission = float(bcfg.get("commission", 0.0))
     slippage_pct = float(bcfg.get("slippage_pct", 0.0002))
     fx_cost_pct = float(bcfg.get("fx_cost_pct", 0.005))
     max_pos_pct = float(cfg.get("risk", {}).get("max_position_pct", 0.10))
-    buy_threshold = 0.55
-    sell_threshold = 0.45
+    buy_threshold = BUY_THRESHOLD
+    sell_threshold = SELL_THRESHOLD
 
     cash = initial_cash
     # positions: symbol -> {qty, avg_price}
@@ -290,166 +292,162 @@ def run_backtest(df: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Any]:
         benchmark:     buy-and-hold equity curve
     Also writes equity CSV and metrics text to logs/backtest_<timestamp>/.
     """
-    n_folds = 5
+    n_folds = 4
     initial_capital = float(cfg.get("initial_capital", 10_000))
+    oos_fraction = float(cfg.get("backtest", {}).get("oos_fraction", 0.20))
 
     df = df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df = df.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
 
-    # Get unique dates across all symbols
     all_dates = sorted(df["timestamp"].dt.normalize().unique())
     n_dates = len(all_dates)
 
-    if n_dates < n_folds * 2:
-        raise ValueError(
-            f"[backtest] Not enough dates ({n_dates}) to create {n_folds} folds."
-        )
+    if n_dates < 300:
+        raise ValueError(f"[backtest] Not enough dates ({n_dates}), need at least 300.")
 
-    fold_size = n_dates // n_folds
-    # Minimum training window: 60% of fold size or at least 60 days
+    # Split: development (first 80%) + true OOS hold-out (last 20%)
+    n_oos = max(50, int(n_dates * oos_fraction))
+    dev_dates = all_dates[:-n_oos]
+    oos_dates = all_dates[-n_oos:]
+    n_dev = len(dev_dates)
+
+    logger.info(
+        "[backtest] Dev: %d dates, OOS hold-out: %d dates (%.0f%%)",
+        n_dev, n_oos, oos_fraction * 100,
+    )
+
+    # ---- Walk-forward on development data ----
+    fold_size = n_dev // n_folds
     min_train = max(60, int(fold_size * 0.6))
 
     all_trades: list[dict] = []
     equity_segments: list[pd.Series] = []
     current_equity = initial_capital
 
-    logger.info(
-        "[backtest] Walk-forward: %d dates, %d folds, fold_size=%d",
-        n_dates,
-        n_folds,
-        fold_size,
-    )
-
     for fold_idx in range(n_folds):
         test_start_idx = fold_idx * fold_size
-        test_end_idx = test_start_idx + fold_size if fold_idx < n_folds - 1 else n_dates
+        test_end_idx = test_start_idx + fold_size if fold_idx < n_folds - 1 else n_dev
 
-        # Train on all data before this fold's test window
         train_end_idx = test_start_idx
-
         if train_end_idx < min_train:
             logger.warning("[backtest] Fold %d: not enough training data, skipping.", fold_idx)
-            # Carry forward equity
-            test_dates = all_dates[test_start_idx:test_end_idx]
-            eq_seg = pd.Series(current_equity, index=pd.DatetimeIndex(test_dates))
-            equity_segments.append(eq_seg)
+            test_dates_fold = dev_dates[test_start_idx:test_end_idx]
+            equity_segments.append(pd.Series(current_equity, index=pd.DatetimeIndex(test_dates_fold)))
             continue
 
-        train_dates = all_dates[:train_end_idx]
-        test_dates = all_dates[test_start_idx:test_end_idx]
+        train_dates_fold = dev_dates[:train_end_idx]
+        test_dates_fold = dev_dates[test_start_idx:test_end_idx]
 
-        train_mask = df["timestamp"].dt.normalize().isin(train_dates)
-        test_mask = df["timestamp"].dt.normalize().isin(test_dates)
-
-        train_df = df[train_mask].copy()
-        test_df = df[test_mask].copy()
+        train_df = df[df["timestamp"].dt.normalize().isin(set(train_dates_fold))].copy()
+        test_df = df[df["timestamp"].dt.normalize().isin(set(test_dates_fold))].copy()
 
         logger.info(
-            "[backtest] Fold %d: train=%d rows, test=%d rows, starting equity=%.2f",
-            fold_idx,
-            len(train_df),
-            len(test_df),
-            current_equity,
+            "[backtest] Fold %d: train=%d rows, test=%d rows",
+            fold_idx, len(train_df), len(test_df),
         )
 
         fold_trades, fold_equity = _run_fold(train_df, test_df, cfg, current_equity)
-
         all_trades.extend(fold_trades)
         equity_segments.append(fold_equity)
-
         if not fold_equity.empty:
             current_equity = float(fold_equity.iloc[-1])
 
-    # Combine equity segments
     if equity_segments:
-        equity_curve = pd.concat(equity_segments).sort_index()
-        # Prepend starting equity
-        start_date = pd.Timestamp(all_dates[0]) - pd.Timedelta(days=1)
-        start_point = pd.Series({start_date: initial_capital})
-        equity_curve = pd.concat([start_point, equity_curve]).sort_index()
+        dev_equity = pd.concat(equity_segments).sort_index()
+        start_date = pd.Timestamp(dev_dates[0]) - pd.Timedelta(days=1)
+        dev_equity = pd.concat([pd.Series({start_date: initial_capital}), dev_equity]).sort_index()
     else:
-        equity_curve = pd.Series({pd.Timestamp(all_dates[0]): initial_capital})
+        dev_equity = pd.Series({pd.Timestamp(dev_dates[0]): initial_capital})
 
-    # Buy-and-hold benchmark
-    # Use first symbol, buy at start, sell at end
-    symbols = df["symbol"].unique()
-    bench_sym = symbols[0]
-    sym_df = df[df["symbol"] == bench_sym].sort_values("timestamp")
+    # ---- True OOS evaluation: train on ALL dev data, test on hold-out ----
+    print("\n[backtest] Running true OOS evaluation on held-out period...")
+    oos_train_df = df[df["timestamp"].dt.normalize().isin(set(dev_dates))].copy()
+    oos_test_df = df[df["timestamp"].dt.normalize().isin(set(oos_dates))].copy()
+    oos_trades, oos_equity_raw = _run_fold(oos_train_df, oos_test_df, cfg, initial_capital)
 
-    bench_dates = sorted(sym_df["timestamp"].dt.normalize().unique())
-    bench_prices_map = (
-        sym_df.groupby(sym_df["timestamp"].dt.normalize())["close"].last()
-    )
-    bench_start_price = float(bench_prices_map.iloc[0])
-    bench_shares = floor(initial_capital / bench_start_price)
-    bench_cash = initial_capital - bench_shares * bench_start_price
+    oos_start = pd.Timestamp(oos_dates[0]) - pd.Timedelta(days=1)
+    oos_equity = pd.concat([pd.Series({oos_start: initial_capital}), oos_equity_raw]).sort_index()
 
-    benchmark_equity = pd.Series(
-        {
-            date: bench_cash + bench_shares * float(bench_prices_map.get(date, bench_start_price))
-            for date in bench_prices_map.index
-        }
-    ).sort_index()
+    # ---- Buy-and-hold benchmark ----
+    sym_df = df[df["symbol"] == df["symbol"].unique()[0]].sort_values("timestamp")
+    bench_prices = sym_df.groupby(sym_df["timestamp"].dt.normalize())["close"].last()
 
-    # Metrics
-    cagr = _calc_cagr(equity_curve)
-    max_dd = _calc_max_drawdown(equity_curve)
-    sharpe = _calc_sharpe(equity_curve)
-    final_equity = float(equity_curve.iloc[-1])
-    n_trades = len(all_trades)
+    def _bh_equity(dates, cap):
+        start_p = float(bench_prices[bench_prices.index.isin(dates)].iloc[0])
+        shares = floor(cap / start_p)
+        cash_rem = cap - shares * start_p
+        return pd.Series(
+            {d: cash_rem + shares * float(bench_prices.get(d, start_p))
+             for d in bench_prices.index if d in set(dates)}
+        ).sort_index()
+
+    bh_full = _bh_equity(all_dates, initial_capital)
+    bh_oos = _bh_equity(oos_dates, initial_capital)
+
+    # ---- Metrics ----
+    dev_cagr = _calc_cagr(dev_equity)
+    dev_dd = _calc_max_drawdown(dev_equity)
+    dev_sharpe = _calc_sharpe(dev_equity)
+
+    oos_cagr = _calc_cagr(oos_equity)
+    oos_dd = _calc_max_drawdown(oos_equity)
+    oos_sharpe = _calc_sharpe(oos_equity)
+    oos_n_trades = len(oos_trades)
+
+    bh_full_cagr = _calc_cagr(bh_full)
+    bh_oos_cagr = _calc_cagr(bh_oos)
+    bh_oos_dd = _calc_max_drawdown(bh_oos)
+    bh_oos_sharpe = _calc_sharpe(bh_oos)
+
+    n_dev_trades = len(all_trades)
 
     metrics = {
-        "CAGR": cagr,
-        "max_drawdown": max_dd,
-        "sharpe_ratio": sharpe,
-        "n_trades": n_trades,
-        "final_equity": final_equity,
+        "CAGR": oos_cagr,
+        "max_drawdown": oos_dd,
+        "sharpe_ratio": oos_sharpe,
+        "n_trades": oos_n_trades,
+        "final_equity": float(oos_equity.iloc[-1]),
         "initial_equity": initial_capital,
-        "total_return": (final_equity - initial_capital) / initial_capital,
+        "total_return": (float(oos_equity.iloc[-1]) - initial_capital) / initial_capital,
     }
 
-    # Benchmark metrics
-    bm_cagr = _calc_cagr(benchmark_equity)
-    bm_max_dd = _calc_max_drawdown(benchmark_equity)
-    bm_sharpe = _calc_sharpe(benchmark_equity)
-    bm_final = float(benchmark_equity.iloc[-1])
-
-    # Save outputs
+    # ---- Save outputs ----
     ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = _LOGS_DIR / f"backtest_{ts}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    equity_csv_path = out_dir / "equity.csv"
-    equity_curve.to_csv(equity_csv_path, header=["equity"])
-    logger.info("[backtest] Equity curve saved to %s", equity_csv_path)
+    oos_equity.to_csv(out_dir / "oos_equity.csv", header=["equity"])
+    dev_equity.to_csv(out_dir / "dev_equity.csv", header=["equity"])
 
-    metrics_txt_path = out_dir / "metrics.txt"
-    with open(metrics_txt_path, "w") as f:
-        f.write("=== Strategy Metrics ===\n")
-        for k, v in metrics.items():
-            f.write(f"  {k}: {v:.4f}\n" if isinstance(v, float) else f"  {k}: {v}\n")
-        f.write("\n=== Buy-and-Hold Benchmark ===\n")
-        f.write(f"  CAGR: {bm_cagr:.4f}\n")
-        f.write(f"  max_drawdown: {bm_max_dd:.4f}\n")
-        f.write(f"  sharpe_ratio: {bm_sharpe:.4f}\n")
-        f.write(f"  final_equity: {bm_final:.2f}\n")
-    logger.info("[backtest] Metrics saved to %s", metrics_txt_path)
+    with open(out_dir / "metrics.txt", "w") as f:
+        f.write(f"Dev walk-forward CAGR : {dev_cagr:.4f}\n")
+        f.write(f"OOS CAGR              : {oos_cagr:.4f}\n")
+        f.write(f"OOS Max Drawdown      : {oos_dd:.4f}\n")
+        f.write(f"OOS Sharpe            : {oos_sharpe:.4f}\n")
+        f.write(f"OOS N Trades          : {oos_n_trades}\n")
+        f.write(f"B&H full CAGR         : {bh_full_cagr:.4f}\n")
+        f.write(f"B&H OOS CAGR          : {bh_oos_cagr:.4f}\n")
 
-    # Print comparison table
-    print("\n" + "=" * 60)
-    print(f"{'Metric':<25} {'Strategy':>12} {'Buy&Hold':>12}")
-    print("-" * 60)
-    print(f"{'CAGR':<25} {cagr:>12.2%} {bm_cagr:>12.2%}")
-    print(f"{'Max Drawdown':<25} {max_dd:>12.2%} {bm_max_dd:>12.2%}")
-    print(f"{'Sharpe Ratio':<25} {sharpe:>12.3f} {bm_sharpe:>12.3f}")
-    print(f"{'Final Equity':<25} {final_equity:>12.2f} {bm_final:>12.2f}")
-    print(f"{'N Trades':<25} {n_trades:>12}")
-    print("=" * 60 + "\n")
+    # ---- Print ----
+    print("\n" + "=" * 62)
+    print(f"  DEV walk-forward ({n_dev} days, {n_dev_trades} trades)")
+    print(f"  CAGR {dev_cagr:+.2%}  |  MaxDD {dev_dd:.2%}  |  Sharpe {dev_sharpe:.3f}")
+    print("-" * 62)
+    print(f"{'Metric':<25} {'OOS Strategy':>15} {'OOS Buy&Hold':>15}")
+    print("-" * 62)
+    print(f"{'CAGR':<25} {oos_cagr:>15.2%} {bh_oos_cagr:>15.2%}")
+    print(f"{'Max Drawdown':<25} {oos_dd:>15.2%} {bh_oos_dd:>15.2%}")
+    print(f"{'Sharpe Ratio':<25} {oos_sharpe:>15.3f} {bh_oos_sharpe:>15.3f}")
+    print(f"{'Final Equity':<25} {float(oos_equity.iloc[-1]):>15.2f} {float(bh_oos.iloc[-1]):>15.2f}")
+    print(f"{'N Trades (OOS)':<25} {oos_n_trades:>15}")
+    print("=" * 62 + "\n")
+    print(f"  Buy&Hold full period CAGR: {bh_full_cagr:.2%}\n")
 
     return {
-        "equity_curve": equity_curve,
-        "trades": all_trades,
+        "equity_curve": oos_equity,
+        "dev_equity": dev_equity,
+        "trades": oos_trades,
         "metrics": metrics,
-        "benchmark": benchmark_equity,
+        "benchmark": bh_oos,
     }
