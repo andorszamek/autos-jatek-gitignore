@@ -14,9 +14,6 @@ yfinance>=0.2.36
 lightgbm>=4.3.0
 scikit-learn>=1.4.0
 
-# Backtest
-vectorbt>=0.26.0
-
 # Utilities
 numpy>=1.26.0
 requests>=2.31.0
