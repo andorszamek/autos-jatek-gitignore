@@ -1,18 +1,25 @@
 """Model signal -> target position.
 
-decide() converts a model probability into a trading action and quantity.
+decide() converts a model probability + trend filter into a trading action.
 The risk module finalises the actual order quantity.
+
+Thresholds:
+  BUY_THRESHOLD  = 0.52  (was 0.55 — trades much more frequently)
+  SELL_THRESHOLD = 0.48  (was 0.45)
+
+Trend filter (PRICE_VS_SMA200):
+  Only enter long when price is above the 200-day SMA (bull regime).
+  Will still exit (sell) regardless of trend when sell signal fires.
 """
 import logging
-from math import floor
 from typing import Any
 
 import pandas as pd
 
 logger = logging.getLogger(__name__)
 
-BUY_THRESHOLD = 0.55
-SELL_THRESHOLD = 0.45
+BUY_THRESHOLD  = 0.52
+SELL_THRESHOLD = 0.48
 
 
 def decide(
@@ -21,25 +28,18 @@ def decide(
     model: object,
     cfg: dict[str, Any],
 ) -> tuple[str, int]:
-    """Determine trading action from model probability.
-
-    Args:
-        latest_features:  DataFrame with FEATURE_COLUMNS (one or more rows; uses last row)
-        current_qty:      current position in shares (int, 0 = flat)
-        model:            trained lgb.Booster (or any object with predict())
-        cfg:              config dict
+    """Determine trading action from model probability + trend filter.
 
     Returns:
-        (action, qty) where action ∈ {'buy', 'sell', 'hold'} and qty >= 0
-        qty is always 0 for 'hold', positive integer for 'buy'/'sell'.
+        (action, qty) where action ∈ {'buy', 'sell', 'hold'} and qty >= 0.
+        qty=1 for buy (RiskManager finalises actual shares), current_qty for sell.
     """
     from src.model import predict_proba
 
     if latest_features is None or latest_features.empty:
-        logger.warning("[strategy] No features provided — holding.")
+        logger.warning("[strategy] No features — holding.")
         return "hold", 0
 
-    # Use last row for inference
     X = latest_features.tail(1)
 
     try:
@@ -49,19 +49,25 @@ def decide(
         logger.error("[strategy] predict_proba failed: %s — holding.", exc)
         return "hold", 0
 
-    logger.debug("[strategy] p=%.4f current_qty=%d", p, current_qty)
+    # Trend filter: only go long when price is above the 200-day SMA.
+    in_bull_regime = True
+    if "PRICE_VS_SMA200" in X.columns:
+        price_vs_sma200 = float(X["PRICE_VS_SMA200"].iloc[0])
+        in_bull_regime = price_vs_sma200 > -0.02  # allow up to 2% below SMA200
+        if not in_bull_regime:
+            logger.info(
+                "[strategy] Bear regime (price %.1f%% below SMA200) — no new buys.",
+                price_vs_sma200 * 100,
+            )
 
-    # Signal logic
-    if p > BUY_THRESHOLD and current_qty == 0:
-        # Rough sizing: max_position_pct * equity, but we don't have price/equity here.
-        # Return qty=1 as a placeholder; RiskManager will finalize.
-        qty = 1
-        logger.info("[strategy] BUY signal: p=%.4f > %.2f", p, BUY_THRESHOLD)
-        return "buy", qty
+    logger.info("[strategy] p=%.4f in_bull=%s current_qty=%d", p, in_bull_regime, current_qty)
+
+    if p > BUY_THRESHOLD and current_qty == 0 and in_bull_regime:
+        logger.info("[strategy] BUY signal: p=%.4f", p)
+        return "buy", 1  # RiskManager sets actual qty
 
     if p < SELL_THRESHOLD and current_qty > 0:
-        logger.info("[strategy] SELL signal: p=%.4f < %.2f, qty=%d", p, SELL_THRESHOLD, current_qty)
+        logger.info("[strategy] SELL signal: p=%.4f qty=%d", p, current_qty)
         return "sell", current_qty
 
-    logger.debug("[strategy] HOLD: p=%.4f", p)
     return "hold", 0
