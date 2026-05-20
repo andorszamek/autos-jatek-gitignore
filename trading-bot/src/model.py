@@ -42,6 +42,14 @@ def train(X: pd.DataFrame, y: pd.Series, cfg: dict[str, Any] | None = None):
         len(X_val),
     )
 
+    print(f"\n{'='*55}")
+    print(f"  LightGBM Training")
+    print(f"  Train samples : {len(X_train):>6d}  ({split/len(X)*100:.0f}%)")
+    print(f"  Val samples   : {len(X_val):>6d}  ({(len(X)-split)/len(X)*100:.0f}%)")
+    print(f"  Features      : {len(X.columns):>6d}")
+    print(f"  Target up%    : {y_train.mean()*100:>5.1f}% train / {y_val.mean()*100:.1f}% val")
+    print(f"{'='*55}")
+
     params = {
         "objective": "binary",
         "metric": ["binary_logloss", "auc"],
@@ -56,8 +64,8 @@ def train(X: pd.DataFrame, y: pd.Series, cfg: dict[str, Any] | None = None):
     dval = lgb.Dataset(X_val, label=y_val, reference=dtrain)
 
     callbacks = [
-        lgb.early_stopping(stopping_rounds=50, verbose=False),
-        lgb.log_evaluation(period=20),
+        lgb.early_stopping(stopping_rounds=50, verbose=True),
+        lgb.log_evaluation(period=10),
     ]
 
     booster = lgb.train(
@@ -74,25 +82,25 @@ def train(X: pd.DataFrame, y: pd.Series, cfg: dict[str, Any] | None = None):
     val_pred = (val_proba >= 0.5).astype(int)
     y_val_arr = np.array(y_val)
 
-    accuracy = (val_pred == y_val_arr).mean()
-    directional_hit = accuracy  # binary classification hit rate
+    accuracy = float((val_pred == y_val_arr).mean())
+    directional_hit = accuracy
 
-    # AUC from lightgbm eval result
     try:
         from sklearn.metrics import roc_auc_score
         val_auc = roc_auc_score(y_val_arr, val_proba)
     except Exception:
         val_auc = float("nan")
 
+    print(f"\n{'='*55}")
+    print(f"  Training complete — best round: {booster.best_iteration}")
+    print(f"  Val AUC              : {val_auc:.4f}")
+    print(f"  Val Accuracy         : {accuracy:.4f}  ({accuracy*100:.1f}%)")
+    print(f"  Directional Hit-Rate : {directional_hit:.4f}  ({directional_hit*100:.1f}%)")
+    print(f"{'='*55}\n")
+
     logger.info(
         "[model] Val AUC=%.4f | Val Accuracy=%.4f | Directional Hit-Rate=%.4f",
-        val_auc,
-        accuracy,
-        directional_hit,
-    )
-    print(
-        f"[model] Val AUC={val_auc:.4f} | Val Accuracy={accuracy:.4f} "
-        f"| Directional Hit-Rate={directional_hit:.4f}"
+        val_auc, accuracy, directional_hit,
     )
 
     return booster
